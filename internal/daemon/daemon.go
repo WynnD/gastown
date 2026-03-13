@@ -1936,6 +1936,15 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 		return
 	}
 
+	// Completed-work guard: if the hook bead is closed, the polecat finished
+	// successfully. gt done does not clear hook_bead (per hq-l6mm5), so a dead
+	// session with a closed hook bead is a normal completion, not a crash.
+	if hookStatus := d.getBeadStatus(info.HookBead); hookStatus == "closed" {
+		d.logger.Printf("Skipping crash alert for %s/%s: hook_bead %s is closed (polecat completed successfully)",
+			rigName, polecatName, info.HookBead)
+		return
+	}
+
 	// Spawning guard: skip polecats being actively started by gt sling.
 	// agent_state='spawning' means the polecat bead was created (with hook_bead
 	// set atomically) but the tmux session hasn't been launched yet. Restarting

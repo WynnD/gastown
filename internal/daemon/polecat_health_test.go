@@ -241,3 +241,97 @@ func TestCheckPolecatHealth_NotifiesWitnessOnCrash(t *testing.T) {
 		t.Errorf("expected witness address myr/witness, got: %q", invocations)
 	}
 }
+
+// writeFakeTestBDWithHookStatus creates a "bd" script that returns different JSON
+// depending on which bead is queried. For the agent bead it returns agent info with
+// hook_bead set; for the hook bead it returns a bead with the given status.
+// This supports testing the completed-work guard (hook bead status check).
+func writeFakeTestBDWithHookStatus(t *testing.T, dir, dbState, hookBead, hookBeadStatus, updatedAt string) string {
+	t.Helper()
+	desc := "agent_state: " + dbState
+	agentJSON := fmt.Sprintf(`[{"id":"gt-myr-polecat-mycat","issue_type":"agent","labels":["gt:agent"],"description":"%s","hook_bead":"%s","agent_state":"%s","updated_at":"%s"}]`,
+		desc, hookBead, dbState, updatedAt)
+	hookJSON := fmt.Sprintf(`[{"id":"%s","status":"%s"}]`, hookBead, hookBeadStatus)
+	// Shell script: if the argument contains the hook bead ID, return hook JSON; otherwise agent JSON
+	script := fmt.Sprintf("#!/bin/sh\ncase \"$*\" in\n  *%s*) echo '%s';;\n  *) echo '%s';;\nesac\n",
+		hookBead, hookJSON, agentJSON)
+	path := filepath.Join(dir, "bd")
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake bd: %v", err)
+	}
+	return path
+}
+
+// TestCheckPolecatHealth_SkipsClosedHookBead verifies that checkPolecatHealth does NOT
+// trigger a crash alert when the hook bead is closed. A closed hook bead means the
+// polecat completed successfully — gt done closes the bead but does not clear hook_bead
+// (per hq-l6mm5), so the daemon must check bead status before alerting.
+func TestCheckPolecatHealth_SkipsClosedHookBead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for tmux and bd")
+	}
+	binDir := t.TempDir()
+	writeFakeTestTmux(t, binDir)
+	recentTime := time.Now().UTC().Format(time.RFC3339)
+	// Agent is "working" with hook_bead set, but the hook bead is closed
+	bdPath := writeFakeTestBDWithHookStatus(t, binDir, "working", "gt-xyz", "closed", recentTime)
+
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	var logBuf strings.Builder
+	d := &Daemon{
+		config: &Config{TownRoot: t.TempDir()},
+		logger: log.New(&logBuf, "", 0),
+		tmux:   tmux.NewTmux(),
+		bdPath: bdPath,
+	}
+
+	d.checkPolecatHealth("myr", "mycat")
+
+	got := logBuf.String()
+	if strings.Contains(got, "CRASH DETECTED") {
+		t.Errorf("must not trigger CRASH DETECTED when hook bead is closed, got: %q", got)
+	}
+	if !strings.Contains(got, "completed successfully") {
+		t.Errorf("expected 'completed successfully' log message, got: %q", got)
+	}
+}
+
+// TestCheckPolecatHealth_StillDetectsCrashForOpenHookBead verifies that a polecat
+// with an open (non-closed) hook bead and a dead session is still detected as crashed.
+func TestCheckPolecatHealth_StillDetectsCrashForOpenHookBead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for tmux and bd")
+	}
+	binDir := t.TempDir()
+	writeFakeTestTmux(t, binDir)
+	recentTime := time.Now().UTC().Format(time.RFC3339)
+	// Agent is "working" with hook_bead set, and the hook bead is still open (not completed)
+	bdPath := writeFakeTestBDWithHookStatus(t, binDir, "working", "gt-xyz", "in_progress", recentTime)
+
+	// Create a fake gt script to capture mail invocations
+	gtLog := filepath.Join(t.TempDir(), "gt-invocations.log")
+	fakeGt := filepath.Join(binDir, "gt")
+	gtScript := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\n", gtLog)
+	if err := os.WriteFile(fakeGt, []byte(gtScript), 0755); err != nil {
+		t.Fatalf("writing fake gt: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	var logBuf strings.Builder
+	d := &Daemon{
+		config: &Config{TownRoot: t.TempDir()},
+		logger: log.New(&logBuf, "", 0),
+		tmux:   tmux.NewTmux(),
+		bdPath: bdPath,
+		gtPath: fakeGt,
+	}
+
+	d.checkPolecatHealth("myr", "mycat")
+
+	got := logBuf.String()
+	if !strings.Contains(got, "CRASH DETECTED") {
+		t.Errorf("expected CRASH DETECTED for open hook bead with dead session, got: %q", got)
+	}
+}
