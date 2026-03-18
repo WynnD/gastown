@@ -809,6 +809,99 @@ func TestDetectZombie_BeadClosedVsDoneIntent(t *testing.T) {
 	}
 }
 
+// TestHandleZombieRestart_AutoReslingWithHookBead verifies that when a zombie
+// polecat has a hook bead, handleZombieRestart calls resetAbandonedBead to
+// resling the bead for re-dispatch (gt-hu3).
+func TestHandleZombieRestart_AutoReslingWithHookBead(t *testing.T) {
+	// Not parallel: overrides package-level verifyCommitOnMain.
+	oldVerify := verifyCommitOnMain
+	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
+		return false, nil // work NOT on main — allow re-dispatch
+	}
+	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) >= 1 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			// For cleanup wisp checks (findAnyCleanupWisp), return empty list
+			if len(args) >= 1 && args[0] == "list" {
+				return `[]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	zombie := &ZombieResult{
+		PolecatName:    "alpha",
+		AgentState:     "working",
+		Classification: ZombieSessionDeadActive,
+		HookBead:       "gt-test123",
+		WasActive:      true,
+	}
+
+	tmpDir := t.TempDir()
+	handleZombieRestart(bd, tmpDir, "testrig", "alpha", "gt-test123", "", zombie, nil)
+
+	// Verify BeadRecovered was set to true (resetAbandonedBead succeeded)
+	if !zombie.BeadRecovered {
+		t.Error("BeadRecovered = false, want true (auto-resling should reset bead for re-dispatch)")
+	}
+
+	// Verify bd update --status=open was called (bead reset for re-dispatch)
+	var foundStatusOpen bool
+	for _, call := range mock.calls {
+		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
+			foundStatusOpen = true
+		}
+	}
+	if !foundStatusOpen {
+		t.Errorf("expected bd update --status=open call for auto-resling, got calls: %v", mock.calls)
+	}
+}
+
+// TestHandleZombieRestart_NoReslingWithoutHookBead verifies that when a zombie
+// polecat has no hook bead, no resling attempt is made (gt-hu3).
+func TestHandleZombieRestart_NoReslingWithoutHookBead(t *testing.T) {
+	t.Parallel()
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	zombie := &ZombieResult{
+		PolecatName:    "alpha",
+		AgentState:     "working",
+		Classification: ZombieSessionDeadActive,
+		WasActive:      true,
+	}
+
+	tmpDir := t.TempDir()
+	handleZombieRestart(bd, tmpDir, "testrig", "alpha", "", "", zombie, nil)
+
+	// Without a hook bead, no resling should happen
+	if zombie.BeadRecovered {
+		t.Error("BeadRecovered = true, want false when no hook bead present")
+	}
+
+	// Verify no bd update --status=open was called
+	for _, call := range mock.calls {
+		if strings.Contains(call, "--status=open") {
+			t.Errorf("unexpected bd update --status=open call without hook bead: %v", mock.calls)
+			break
+		}
+	}
+}
+
 func TestResetAbandonedBead_EmptyHookBead(t *testing.T) {
 	t.Parallel()
 	// resetAbandonedBead should return false for empty hookBead

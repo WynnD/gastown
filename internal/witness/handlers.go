@@ -1064,7 +1064,7 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 			continue // Either handled or not a zombie
 		}
 
-		if zombie, found := detectZombieDeadSession(bd, workDir, townRoot, rigName, polecatName, sessionName, t, doneIntent, detectedAt, witCfg, snap); found {
+		if zombie, found := detectZombieDeadSession(bd, workDir, townRoot, rigName, polecatName, sessionName, t, doneIntent, detectedAt, witCfg, snap, router); found {
 			result.Zombies = append(result.Zombies, zombie)
 		}
 	}
@@ -1197,7 +1197,7 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 //
 // gt-dsgp: Uses restart-first policy. Instead of nuking polecats with dead sessions,
 // restarts them to preserve worktrees and branches.
-func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, detectedAt time.Time, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot) (ZombieResult, bool) {
+func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, detectedAt time.Time, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot, router *mail.Router) (ZombieResult, bool) {
 	// gt-2gra: Agent state and hook bead are read from the pre-fetched snapshot.
 	snapState, snapHook := "", ""
 	snapActiveMR := ""
@@ -1302,7 +1302,7 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 	// gt-dsgp: Restart instead of nuking. For dirty state, escalate AND restart.
 	// gt-2gra: Use snapshot's cleanup status instead of calling getCleanupStatus.
 	cleanupStatus := snap.cleanupStatus()
-	handleZombieRestart(bd, workDir, rigName, polecatName, snapHook, cleanupStatus, &zombie)
+	handleZombieRestart(bd, workDir, rigName, polecatName, snapHook, cleanupStatus, &zombie, router)
 	return zombie, true
 }
 
@@ -1328,7 +1328,12 @@ func isZombieState(agentState beads.AgentState, hookBead string) bool {
 // wisp ID) ensures exactly one patrol proceeds with the restart.
 //
 // gt-qnp: If Mayor ACP session is active, vetoes automatic cleanup to allow Mayor review.
-func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cleanupStatus string, zombie *ZombieResult) {
+//
+// gt-hu3: Auto-resling. When a hook bead is present and the router is available,
+// resets the bead to open via resetAbandonedBead for re-dispatch to any available
+// polecat. The existing circuit breaker (ShouldBlockRespawn) limits reslings to
+// MaxBeadRespawns times before escalating to the mayor, preventing spawn storms.
+func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cleanupStatus string, zombie *ZombieResult, router *mail.Router) {
 	zombie.CleanupStatus = cleanupStatus
 	skipRestart := false
 
@@ -1403,7 +1408,20 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 		return
 	}
 
+	// gt-hu3: Auto-resling. Reset the hook bead to open for re-dispatch before
+	// restarting the session. This lets the deacon assign the bead to any
+	// available polecat (possibly the same one, possibly a different one).
+	// resetAbandonedBead handles:
+	//   - Respawn counting (RecordBeadRespawn)
+	//   - Circuit breaking after N failures (ShouldBlockRespawn → mayor escalation)
+	//   - Work-already-on-main detection (closes bead instead of re-dispatching)
+	//   - Sending RECOVERED_BEAD mail to deacon for re-dispatch
+	if hookBead != "" {
+		zombie.BeadRecovered = resetAbandonedBead(bd, workDir, rigName, hookBead, polecatName, router)
+	}
+
 	// Restart regardless of cleanup state — the worktree is preserved.
+	// The restarted polecat will go idle (no hook) and be available for reuse.
 	if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
 		if zombie.Error == nil {
 			zombie.Error = fmt.Errorf("restart: %w", err)
