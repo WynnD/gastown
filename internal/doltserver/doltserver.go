@@ -1168,7 +1168,6 @@ behavior:
   dolt_transaction_commit: true
   auto_gc_behavior:
     enable: true
-    archive_level: 1
 `,
 		config.LogLevel,
 		config.Port,
@@ -1369,6 +1368,16 @@ func Start(townRoot string) error {
 	cmd := exec.Command("dolt", args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+
+	// Redirect dolt's temp files to a dedicated directory to prevent inode
+	// flooding in /tmp. Dolt's internal operations (metrics, GC, noms layer)
+	// create UUID-named temp files at ~10-40/sec which can exhaust /tmp inodes.
+	doltTmpDir := filepath.Join(config.DataDir, "tmp")
+	if err := os.MkdirAll(doltTmpDir, 0755); err != nil {
+		logFile.Close()
+		return fmt.Errorf("creating dolt tmp dir: %w", err)
+	}
+	cmd.Env = append(os.Environ(), "TMPDIR="+doltTmpDir)
 
 	// Detach from terminal and put dolt in its own process group so that
 	// signals sent to the parent process group (e.g. SIGHUP when the caller
